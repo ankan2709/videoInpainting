@@ -177,6 +177,27 @@ class deconv(nn.Module):
                  kernel_size=3,
                  padding=0):
         super().__init__()
+        self.conv = nn.Conv2d(input_channel,
+                              output_channel,
+                              kernel_size=kernel_size,
+                              stride=1,
+                              padding=padding)
+
+    def forward(self, x):
+        x = F.interpolate(x,
+                          scale_factor=2,
+                          mode='bilinear',
+                          align_corners=True)
+        return self.conv(x)
+    
+
+class Gateddeconv(nn.Module):
+    def __init__(self,
+                 input_channel,
+                 output_channel,
+                 kernel_size=3,
+                 padding=0):
+        super().__init__()
         self.conv = GatedConv2d(input_channel,
                               output_channel,
                               kernel_size=kernel_size,
@@ -204,9 +225,146 @@ class InpaintGenerator(BaseNetwork):
         self.decoder = nn.Sequential(
             deconv(channel // 2, 128, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             deconv(64, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1))
+
+        # feature propagation module
+        self.feat_prop_module = BidirectionalPropagation(channel // 2)
+
+        # soft split and soft composition
+        kernel_size = (7, 7)
+        padding = (3, 3)
+        stride = (3, 3)
+        output_size = (60, 108)
+        t2t_params = {
+            'kernel_size': kernel_size,
+            'stride': stride,
+            'padding': padding
+        }
+        self.ss = SoftSplit(channel // 2,
+                            hidden,
+                            kernel_size,
+                            stride,
+                            padding,
+                            t2t_param=t2t_params)
+        self.sc = SoftComp(channel // 2, hidden, kernel_size, stride, padding)
+
+        n_vecs = 1
+        for i, d in enumerate(kernel_size):
+            n_vecs *= int((output_size[i] + 2 * padding[i] -
+                           (d - 1) - 1) / stride[i] + 1)
+
+        blocks = []
+        depths = 8
+        num_heads = [4] * depths
+        window_size = [(5, 9)] * depths
+        focal_windows = [(5, 9)] * depths
+        focal_levels = [2] * depths
+        pool_method = "fc"
+
+        for i in range(depths):
+            blocks.append(
+                TemporalFocalTransformerBlock(dim=hidden,
+                                              num_heads=num_heads[i],
+                                              window_size=window_size[i],
+                                              focal_level=focal_levels[i],
+                                              focal_window=focal_windows[i],
+                                              n_vecs=n_vecs,
+                                              t2t_params=t2t_params,
+                                              pool_method=pool_method))
+        self.transformer = nn.Sequential(*blocks)
+
+        if init_weights:
+            self.init_weights()
+            # Need to initial the weights of MSDeformAttn specifically
+            for m in self.modules():
+                if isinstance(m, SecondOrderDeformableAlignment):
+                    m.init_offset()
+
+        # flow completion network
+        self.update_spynet = SPyNet()
+
+    def forward_bidirect_flow(self, masked_local_frames):
+        b, l_t, c, h, w = masked_local_frames.size()
+
+        # compute forward and backward flows of masked frames
+        masked_local_frames = F.interpolate(masked_local_frames.view(
+            -1, c, h, w),
+                                            scale_factor=1 / 4,
+                                            mode='bilinear',
+                                            align_corners=True,
+                                            recompute_scale_factor=True)
+        masked_local_frames = masked_local_frames.view(b, l_t, c, h // 4,
+                                                       w // 4)
+        mlf_1 = masked_local_frames[:, :-1, :, :, :].reshape(
+            -1, c, h // 4, w // 4)
+        mlf_2 = masked_local_frames[:, 1:, :, :, :].reshape(
+            -1, c, h // 4, w // 4)
+        pred_flows_forward = self.update_spynet(mlf_1, mlf_2)
+        pred_flows_backward = self.update_spynet(mlf_2, mlf_1)
+
+        pred_flows_forward = pred_flows_forward.view(b, l_t - 1, 2, h // 4,
+                                                     w // 4)
+        pred_flows_backward = pred_flows_backward.view(b, l_t - 1, 2, h // 4,
+                                                       w // 4)
+
+        return pred_flows_forward, pred_flows_backward
+
+    def forward(self, masked_frames, num_local_frames):
+        l_t = num_local_frames
+        b, t, ori_c, ori_h, ori_w = masked_frames.size()
+
+        # normalization before feeding into the flow completion module
+        masked_local_frames = (masked_frames[:, :l_t, ...] + 1) / 2
+        pred_flows = self.forward_bidirect_flow(masked_local_frames)
+
+        # extracting features and performing the feature propagation on local features
+        enc_feat = self.encoder(masked_frames.view(b * t, ori_c, ori_h, ori_w)) # what is the shape of the masked frames? and the number of frames (local + non local)
+        _, c, h, w = enc_feat.size()
+        fold_output_size = (h, w)
+        local_feat = enc_feat.view(b, t, c, h, w)[:, :l_t, ...]
+        ref_feat = enc_feat.view(b, t, c, h, w)[:, l_t:, ...] # we do the splitting here
+        local_feat = self.feat_prop_module(local_feat, pred_flows[0],
+                                           pred_flows[1])
+        enc_feat = torch.cat((local_feat, ref_feat), dim=1)
+
+        # content hallucination through stacking multiple temporal focal transformer blocks
+        trans_feat = self.ss(enc_feat.view(-1, c, h, w), b, fold_output_size)
+        trans_feat = self.transformer([trans_feat, fold_output_size])
+        trans_feat = self.sc(trans_feat[0], t, fold_output_size)
+        trans_feat = trans_feat.view(b, t, -1, h, w)
+        enc_feat = enc_feat + trans_feat  # why? residual connection?   or bypass?output of transformer and the concat of flow and encoder
+
+        # decode frames from features
+        output = self.decoder(enc_feat.view(b * t, c, h, w))
+        output = torch.tanh(output)
+        return output, pred_flows
+
+
+"""
+gated inpaint generator. lets see if this works or not
+
+"""
+
+class GatedInpaintGenerator(BaseNetwork):
+    def __init__(self, init_weights=True):
+        super(GatedInpaintGenerator, self).__init__()
+        channel = 256
+        hidden = 512
+
+        # encoder
+        self.encoder = GatedEncoder()
+
+        # decoder
+        self.decoder = nn.Sequential(
+            Gateddeconv(channel // 2, 128, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            GatedConv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            Gateddeconv(64, 64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             GatedConv2d(64, 3, kernel_size=3, stride=1, padding=1))
 
@@ -321,6 +479,7 @@ class InpaintGenerator(BaseNetwork):
         output = self.decoder(enc_feat.view(b * t, c, h, w))
         output = torch.tanh(output)
         return output, pred_flows
+
 
 
 # ######################################################################
