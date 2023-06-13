@@ -47,7 +47,8 @@ class TrainDataset(torch.utils.data.Dataset):
         remain_idx = list(set(complete_idx_set) - set(local_idx))
         ref_index = sorted(random.sample(remain_idx, num_ref_frame))
 
-        return local_idx + ref_index
+        return local_idx + ref_index    # [93, 94, 95, 96, 97] [22, 78, 87]
+
 
     def load_item(self, index):
         video_name = self.video_names[index]

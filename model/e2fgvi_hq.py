@@ -110,64 +110,11 @@ class Encoder(nn.Module):
         return out
 
 
-""" implement gated convolution to see if it can improve model performance
-also check if after using the gated conv, can we remove the transformer layer
-and if the inference time improves
-"""
-
-class GatedConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, groups=1):
-        super(GatedConv2d, self).__init__()
-        
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups)
-        self.gate = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups)
-        
-    def forward(self, x):
-        conv_output = self.conv(x)
-        gate_output = torch.sigmoid(self.gate(x))
-        output = conv_output * gate_output
-        return output
-
-class GatedEncoder(nn.Module):
+class DepthEncoder(nn.Module):
     def __init__(self):
-        super(GatedEncoder, self).__init__()
-        self.group = [1, 2, 4, 8, 1]
-        self.layers = nn.ModuleList([
-            GatedConv2d(3, 64, kernel_size=3, stride=2, padding=1), 
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(256, 384, kernel_size=3, stride=1, padding=1, groups=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(640, 512, kernel_size=3, stride=1, padding=1, groups=2),
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(768, 384, kernel_size=3, stride=1, padding=1, groups=4),
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(640, 256, kernel_size=3, stride=1, padding=1, groups=8),
-            nn.LeakyReLU(0.2, inplace=True),
-            GatedConv2d(512, 128, kernel_size=3, stride=1, padding=1, groups=1),
-            nn.LeakyReLU(0.2, inplace=True)
-        ])
+        super(DepthEncoder).__init__()
+        pass
 
-    def forward(self, x):
-        bt, c, _, _ = x.size()
-        # h, w = h//4, w//4
-        out = x
-        for i, layer in enumerate(self.layers):
-            if i == 8:
-                x0 = out
-                _, _, h, w = x0.size()
-            if i > 8 and i % 2 == 0:
-                g = self.group[(i - 8) // 2]
-                x = x0.view(bt, g, -1, h, w)
-                o = out.view(bt, g, -1, h, w)
-                out = torch.cat([x, o], 2).view(bt, -1, h, w)
-            out = layer(out)
-        return out
 
 
 class deconv(nn.Module):
